@@ -1,6 +1,28 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+
+// Valida variáveis de ambiente antes de importar o Prisma
+function validateEnv() {
+    const required = ['DATABASE_URL'];
+    const missing = required.filter(key => !process.env[key]);
+    
+    if (missing.length > 0) {
+        console.error('❌ Variáveis de ambiente obrigatórias não encontradas:');
+        missing.forEach(key => console.error(`   - ${key}`));
+        console.error('\n💡 Configure as variáveis de ambiente na Railway:');
+        console.error('   - DATABASE_URL');
+        console.error('   - DIRECT_URL (opcional, mas recomendado)');
+        return false;
+    }
+    return true;
+}
+
+// Valida antes de importar módulos que dependem do Prisma
+if (!validateEnv()) {
+    console.error('\n⚠️  Servidor iniciará, mas funcionalidades de banco não estarão disponíveis.');
+}
+
 const { extractLinksWithPuppeteer, saveToSupabase, prisma } = require('./puppeteer_scraper');
 
 const app = express();
@@ -12,6 +34,73 @@ app.use(express.json());
 
 // Variável para controlar se há um scraping em andamento
 let isScraping = false;
+
+// Rota raiz - informações da API
+app.get('/', (req, res) => {
+    const hasDatabase = !!process.env.DATABASE_URL;
+    
+    res.json({
+        name: 'Economist Scraper API',
+        version: '1.0.0',
+        description: 'API para scraping de artigos do The Economist sobre Inteligência Artificial',
+        status: 'running',
+        timestamp: new Date().toISOString(),
+        environment: {
+            nodeEnv: process.env.NODE_ENV || 'development',
+            databaseConfigured: hasDatabase,
+            port: PORT
+        },
+        endpoints: {
+            health: '/health',
+            envCheck: '/api/env-check',
+            scrape: {
+                method: 'POST',
+                path: '/api/scrape',
+                description: 'Executar scraping e retornar resultado'
+            },
+            posts: {
+                method: 'GET',
+                path: '/api/posts',
+                description: 'Listar posts do banco de dados',
+                requiresDatabase: true
+            },
+            postByUrl: {
+                method: 'GET',
+                path: '/api/posts/:url',
+                description: 'Buscar post específico por URL',
+                requiresDatabase: true
+            },
+            unpostedPost: {
+                method: 'GET',
+                path: '/api/posts/unposted/single',
+                description: 'Obter um único post não publicado',
+                requiresDatabase: true
+            }
+        },
+        documentation: 'Veja o README.md para mais informações'
+    });
+});
+
+// Endpoint para verificar variáveis de ambiente
+app.get('/api/env-check', (req, res) => {
+    const env = {
+        DATABASE_URL: process.env.DATABASE_URL ? '✅ Configurada' : '❌ Não configurada',
+        DIRECT_URL: process.env.DIRECT_URL ? '✅ Configurada' : '⚠️  Opcional (não configurada)',
+        NODE_ENV: process.env.NODE_ENV || 'development',
+        PORT: process.env.PORT || '3000 (padrão)'
+    };
+    
+    const allConfigured = !!process.env.DATABASE_URL;
+    
+    res.json({
+        success: allConfigured,
+        message: allConfigured 
+            ? 'Todas as variáveis obrigatórias estão configuradas' 
+            : 'Algumas variáveis obrigatórias estão faltando',
+        environment: env,
+        timestamp: new Date().toISOString()
+    });
+});
 
 // Endpoint de health check
 app.get('/health', (req, res) => {
@@ -91,6 +180,13 @@ app.post('/api/scrape', async (req, res) => {
 
 // Endpoint para listar posts do banco (opcional - você pode ajustar conforme sua tabela)
 app.get('/api/posts', async (req, res) => {
+    if (!process.env.DATABASE_URL) {
+        return res.status(500).json({
+            error: 'Variável de ambiente não configurada',
+            message: 'DATABASE_URL não está configurada. Configure na Railway: Settings > Variables'
+        });
+    }
+
     try {
         const { limit = 50, offset = 0 } = req.query;
         
@@ -121,6 +217,13 @@ app.get('/api/posts', async (req, res) => {
 
 // Endpoint para obter um post específico por URL
 app.get('/api/posts/:url', async (req, res) => {
+    if (!process.env.DATABASE_URL) {
+        return res.status(500).json({
+            error: 'Variável de ambiente não configurada',
+            message: 'DATABASE_URL não está configurada. Configure na Railway: Settings > Variables'
+        });
+    }
+
     try {
         const encodedUrl = req.params.url;
         const url = decodeURIComponent(encodedUrl);
@@ -149,6 +252,17 @@ app.get('/api/posts/:url', async (req, res) => {
 
 // Endpoint para obter um único post não publicado
 app.get('/api/posts/unposted/single', async (req, res) => {
+    // Verifica se DATABASE_URL está configurada
+    if (!process.env.DATABASE_URL) {
+        return res.status(500).json({
+            success: false,
+            error: 'Variável de ambiente não configurada',
+            message: 'DATABASE_URL não está configurada. Configure na Railway: Settings > Variables',
+            help: 'Adicione a variável DATABASE_URL com a URL de conexão do Supabase',
+            timestamp: new Date().toISOString()
+        });
+    }
+
     try {
         console.log('🔍 Buscando post não publicado...');
         
@@ -173,10 +287,20 @@ app.get('/api/posts/unposted/single', async (req, res) => {
         });
     } catch (error) {
         console.error('❌ Erro ao buscar post não publicado:', error);
+        
+        // Mensagem de erro mais clara
+        let errorMessage = error.message;
+        if (error.message.includes('DATABASE_URL')) {
+            errorMessage = 'DATABASE_URL não está configurada. Configure na Railway: Settings > Variables';
+        } else if (error.message.includes('Environment variable not found')) {
+            errorMessage = 'Variável de ambiente não encontrada. Verifique se DATABASE_URL está configurada na Railway.';
+        }
+        
         res.status(500).json({ 
             success: false,
             error: 'Erro ao buscar post não publicado',
-            message: error.message,
+            message: errorMessage,
+            details: process.env.NODE_ENV === 'development' ? error.stack : undefined,
             timestamp: new Date().toISOString()
         });
     }
@@ -192,15 +316,27 @@ app.use((err, req, res, next) => {
 });
 
 // Inicia o servidor
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Servidor rodando na porta ${PORT}`);
     console.log(`🌍 Ambiente: ${process.env.NODE_ENV || 'development'}`);
     console.log(`📡 Health check: http://0.0.0.0:${PORT}/health`);
     console.log(`🔗 API endpoints:`);
+    console.log(`   GET    / - Informações da API`);
+    console.log(`   GET    /health - Health check`);
     console.log(`   POST   /api/scrape - Executar scraping e retornar resultado`);
     console.log(`   GET    /api/posts - Listar posts`);
     console.log(`   GET    /api/posts/:url - Buscar post por URL`);
     console.log(`   GET    /api/posts/unposted/single - Obter um único post não publicado`);
+});
+
+// Tratamento de erros na inicialização do servidor
+server.on('error', (error) => {
+    if (error.code === 'EADDRINUSE') {
+        console.error(`❌ Porta ${PORT} já está em uso`);
+    } else {
+        console.error('❌ Erro ao iniciar servidor:', error);
+    }
+    process.exit(1);
 });
 
 // Graceful shutdown
